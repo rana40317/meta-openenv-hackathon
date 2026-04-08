@@ -1,0 +1,121 @@
+name: HealthyFoodChoice
+version: "1.0.0"
+description: >
+  A reinforcement learning environment where an LLM agent must decide between
+  healthy and junk food options across multiple meals. The agent observes meal
+  context (hunger, budget, health goal, available options) and must maximize
+  healthy food choices to improve the simulated health score.
+
+author: HealthRL Team
+license: MIT
+
+environment:
+  type: sequential
+  real_world_task: true
+  description: "Meal-by-meal food choice optimization for healthy eating habits"
+
+observation_space:
+  type: structured
+  schema: EnvironmentObservation
+  fields:
+    - name: context
+      type: MealContext
+      description: "Current meal context including hunger, budget, health goal"
+    - name: food_options
+      type: "List[FoodItem]"
+      description: "Available food items to choose from"
+    - name: current_health_score
+      type: float
+      range: [0.0, 100.0]
+      description: "Agent's current cumulative health score"
+    - name: day
+      type: int
+      description: "Current day number"
+    - name: meal_number
+      type: int
+      description: "Current meal number in the episode"
+    - name: task_id
+      type: str
+    - name: task_description
+      type: str
+
+action_space:
+  type: discrete
+  schema: FoodChoiceAction
+  fields:
+    - name: selected_item_index
+      type: int
+      description: "Index (0-based) of chosen food item from food_options list"
+    - name: reasoning
+      type: str
+      required: false
+      description: "Optional reasoning for the choice"
+
+reward:
+  range: [0.0, 1.0]
+  type: continuous
+  description: >
+    Reward is based on nutritional quality of chosen food.
+    Healthy choice: 0.70 - 1.00 (based on nutrition_score).
+    Neutral choice: 0.30 - 0.50.
+    Junk choice: 0.00 - 0.20 (partial signal to prevent gradient collapse).
+    Small budget adherence bonus: +0.02 if within budget.
+
+tasks:
+  - id: task_1_easy
+    difficulty: easy
+    num_steps: 5
+    description: "Binary healthy vs junk choice, 2 options per meal"
+    grader: graders.task_graders.grade_task_1_easy
+
+  - id: task_2_medium
+    difficulty: medium
+    num_steps: 7
+    description: "4-option meals with neutral foods, budget constraint, weight loss goal"
+    grader: graders.task_graders.grade_task_2_medium
+
+  - id: task_3_hard
+    difficulty: hard
+    num_steps: 10
+    description: "5-option meals, tight budget, muscle gain goal, health trajectory optimization"
+    grader: graders.task_graders.grade_task_3_hard
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    params:
+      - name: task_id
+        type: str
+        default: task_1_easy
+    returns: ResetResult
+
+  step:
+    method: POST
+    path: /step
+    body: FoodChoiceAction
+    params:
+      - name: task_id
+        type: str
+        default: task_1_easy
+    returns: StepResult
+
+  state:
+    method: GET
+    path: /state
+    params:
+      - name: task_id
+        type: str
+        default: task_1_easy
+    returns: StateResult
+
+  health:
+    method: GET
+    path: /health
+    returns: "{'status': 'ok'}"
+
+deployment:
+  platform: "Hugging Face Spaces"
+  framework: docker
+  port: 7860
+  base_url_env: API_BASE_URL
