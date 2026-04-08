@@ -1,0 +1,17 @@
+[project]
+name = "meta-openenv-hackathon"
+version = "0.1.0"
+description = "Meta PyTorch OpenEnv Hackathon Solution"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core>=0.2.0",
+    "openai>=1.0.0",
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+server = "inference:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends.legacy:build"
