@@ -1,7 +1,4 @@
-"""
-FastAPI application implementing the OpenEnv spec.
-Endpoints: /, /health, /tasks, /reset, /step, /state
-"""
+
 import os
 import sys
 from fastapi import FastAPI, HTTPException
