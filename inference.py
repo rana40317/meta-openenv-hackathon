@@ -1,38 +1,35 @@
 """
-inference.py — Baseline inference script for HealthyFoodChoice RL environment.
+inference.py — Self-contained inference script for HealthyFoodChoice RL environment.
 
-Uses OpenAI client (Anthropic-compatible endpoint) to run the LLM agent.
-Emits structured [START], [STEP], [END] logs to stdout.
+Starts the FastAPI env server in a background thread, waits for it to be ready,
+then runs the LLM agent against it.
 
-Environment variables required:
-  API_BASE_URL  — API endpoint for the LLM
+Environment variables (injected by validator):
+  API_BASE_URL  — LLM API endpoint
   MODEL_NAME    — Model identifier
   HF_TOKEN      — Hugging Face / API key
-
-Usage:
-  python inference.py
+  ENV_BASE_URL  — (optional) external env server; if not set, starts one locally
 """
 import os
 import sys
 import json
 import time
+import threading
 
 # ── Safe imports ──────────────────────────────────────────────────────────────
 try:
     import requests
 except ImportError as e:
-    print(json.dumps({"event": "IMPORT_ERROR", "error": f"requests not installed: {e}", "timestamp": time.time()}), flush=True)
+    print(json.dumps({"event": "IMPORT_ERROR", "error": f"requests: {e}"}), flush=True)
     sys.exit(1)
 
 try:
     from openai import OpenAI
 except ImportError as e:
-    print(json.dumps({"event": "IMPORT_ERROR", "error": f"openai not installed: {e}", "timestamp": time.time()}), flush=True)
+    print(json.dumps({"event": "IMPORT_ERROR", "error": f"openai: {e}"}), flush=True)
     sys.exit(1)
 
-# ── Environment config ────────────────────────────────────────────────────────
-# NOTE: Never hard-exit if vars are missing — validator injects them at runtime.
-# Check multiple possible env var names and fall back to safe defaults.
+# ── Config ────────────────────────────────────────────────────────────────────
 API_BASE_URL = (
     os.environ.get("API_BASE_URL")
     or os.environ.get("OPENAI_BASE_URL")
@@ -47,159 +44,174 @@ HF_TOKEN = (
     os.environ.get("HF_TOKEN")
     or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     or os.environ.get("OPENAI_API_KEY")
-    or "dummy-token"   # allows client to init; real calls will fail gracefully
+    or "dummy-token"
 )
-ENV_BASE_URL = (
-    os.environ.get("ENV_BASE_URL")
-    or "http://localhost:7860"
-)
+ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "")  # empty = start our own server
 
+LOCAL_PORT = 7860
 TASKS = ["task_1_easy", "task_2_medium", "task_3_hard"]
 
-# ── Log config at startup ─────────────────────────────────────────────────────
+# ── Print config immediately so validator always sees output ──────────────────
 print(json.dumps({
     "event":        "CONFIG",
     "api_base_url": API_BASE_URL,
     "model":        MODEL_NAME,
-    "env_url":      ENV_BASE_URL,
-    "hf_token_set": bool(HF_TOKEN and HF_TOKEN != "dummy-token"),
+    "env_url":      ENV_BASE_URL or f"http://localhost:{LOCAL_PORT} (local)",
+    "hf_token_set": HF_TOKEN != "dummy-token",
     "timestamp":    time.time(),
 }), flush=True)
 
-# ── Initialise OpenAI client safely ──────────────────────────────────────────
+
+# ── Start local server if no external ENV_BASE_URL provided ──────────────────
+def start_local_server(port: int):
+    """Start the FastAPI app in a background thread."""
+    try:
+        import uvicorn
+
+        # Import app — handle both flat layout (root) and nested layout
+        try:
+            # Flat layout: app.py at root imports from root-level modules
+            # Patch sys.path so relative imports work
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from app import app as fastapi_app
+        except ImportError as e:
+            print(json.dumps({"event": "SERVER_IMPORT_ERROR", "error": str(e)}), flush=True)
+            return
+
+        config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=port, log_level="error")
+        server = uvicorn.Server(config)
+        server.run()
+    except Exception as e:
+        print(json.dumps({"event": "SERVER_START_ERROR", "error": str(e)}), flush=True)
+
+
+def wait_for_server(base_url: str, timeout: int = 60) -> bool:
+    """Poll /health until server is up. Returns True if ready."""
+    for i in range(timeout):
+        try:
+            r = requests.get(f"{base_url}/health", timeout=2)
+            if r.status_code == 200:
+                print(json.dumps({
+                    "event": "SERVER_READY",
+                    "url": base_url,
+                    "waited_seconds": i,
+                    "timestamp": time.time(),
+                }), flush=True)
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print(json.dumps({
+        "event": "SERVER_TIMEOUT",
+        "error": f"Server at {base_url} not ready after {timeout}s",
+        "timestamp": time.time(),
+    }), flush=True)
+    return False
+
+
+# Determine env URL and start server if needed
+if ENV_BASE_URL:
+    # Validator injected an external server — use it directly
+    ACTIVE_ENV_URL = ENV_BASE_URL
+    print(json.dumps({"event": "USING_EXTERNAL_ENV", "url": ACTIVE_ENV_URL}), flush=True)
+else:
+    # No external server — start our own
+    ACTIVE_ENV_URL = f"http://localhost:{LOCAL_PORT}"
+    print(json.dumps({"event": "STARTING_LOCAL_SERVER", "port": LOCAL_PORT}), flush=True)
+
+    server_thread = threading.Thread(
+        target=start_local_server,
+        args=(LOCAL_PORT,),
+        daemon=True,
+    )
+    server_thread.start()
+
+    if not wait_for_server(ACTIVE_ENV_URL, timeout=60):
+        print(json.dumps({
+            "event": "FATAL",
+            "error": "Local server failed to start. Cannot run inference.",
+            "timestamp": time.time(),
+        }), flush=True)
+        sys.exit(1)
+
+
+# ── Init OpenAI client ────────────────────────────────────────────────────────
 try:
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 except Exception as e:
-    print(json.dumps({
-        "event":     "CLIENT_INIT_ERROR",
-        "error":     str(e),
-        "timestamp": time.time(),
-    }), flush=True)
+    print(json.dumps({"event": "CLIENT_INIT_ERROR", "error": str(e)}), flush=True)
     sys.exit(1)
 
 
-# ── Structured logging helpers ────────────────────────────────────────────────
-def log_start(task_id: str, episode: int):
+# ── Structured logging ────────────────────────────────────────────────────────
+def log_start(task_id, episode):
     print(json.dumps({
-        "event":     "START",
-        "task_id":   task_id,
-        "episode":   episode,
-        "model":     MODEL_NAME,
+        "event": "START", "task_id": task_id,
+        "episode": episode, "model": MODEL_NAME,
         "timestamp": time.time(),
     }), flush=True)
 
 
-def log_step(task_id: str, episode: int, step: int, action: int,
-             reward: float, done: bool, info: dict):
+def log_step(task_id, episode, step, action, reward, done, info):
     print(json.dumps({
-        "event":         "STEP",
-        "task_id":       task_id,
-        "episode":       episode,
-        "step":          step,
-        "action":        action,
-        "reward":        reward,
-        "done":          done,
-        "chosen_food":   info.get("chosen_food", ""),
+        "event": "STEP", "task_id": task_id, "episode": episode,
+        "step": step, "action": action, "reward": reward, "done": done,
+        "chosen_food": info.get("chosen_food", ""),
         "food_category": info.get("food_category", ""),
-        "health_score":  info.get("health_score_after", 0.0),
-        "timestamp":     time.time(),
+        "health_score": info.get("health_score_after", 0.0),
+        "timestamp": time.time(),
     }), flush=True)
 
 
-def log_end(task_id: str, episode: int, total_reward: float,
-            grader_score: float, steps: int, choices: list):
+def log_end(task_id, episode, total_reward, grader_score, steps, choices):
     print(json.dumps({
-        "event":        "END",
-        "task_id":      task_id,
-        "episode":      episode,
-        "total_reward": total_reward,
-        "grader_score": grader_score,
-        "steps":        steps,
-        "choices":      choices,
-        "timestamp":    time.time(),
+        "event": "END", "task_id": task_id, "episode": episode,
+        "total_reward": total_reward, "grader_score": grader_score,
+        "steps": steps, "choices": choices,
+        "timestamp": time.time(),
     }), flush=True)
 
 
-# ── Environment client helpers ────────────────────────────────────────────────
-def env_reset(task_id: str) -> dict:
+# ── Env HTTP helpers ──────────────────────────────────────────────────────────
+def env_reset(task_id):
+    try:
+        r = requests.post(f"{ACTIVE_ENV_URL}/reset", params={"task_id": task_id}, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise RuntimeError(f"env_reset failed for {task_id}: {e}")
+
+
+def env_step(task_id, action_index, reasoning=""):
     try:
         r = requests.post(
-            f"{ENV_BASE_URL}/reset",
+            f"{ACTIVE_ENV_URL}/step",
+            json={"selected_item_index": action_index, "reasoning": reasoning},
             params={"task_id": task_id},
             timeout=30,
         )
         r.raise_for_status()
         return r.json()
-    except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(f"Cannot connect to environment at {ENV_BASE_URL}. Error: {e}")
-    except requests.exceptions.Timeout:
-        raise RuntimeError(f"Timeout on /reset for task {task_id} at {ENV_BASE_URL}")
-    except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"HTTP error on /reset for {task_id}: {e}")
-
-
-def env_step(task_id: str, action_index: int, reasoning: str = "") -> dict:
-    payload = {"selected_item_index": action_index, "reasoning": reasoning}
-    try:
-        r = requests.post(
-            f"{ENV_BASE_URL}/step",
-            json=payload,
-            params={"task_id": task_id},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(f"Cannot connect to environment at {ENV_BASE_URL}. Error: {e}")
-    except requests.exceptions.Timeout:
-        raise RuntimeError(f"Timeout on /step for task {task_id}")
-    except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"HTTP error on /step for {task_id}: {e}")
-
-
-def env_state(task_id: str) -> dict:
-    try:
-        r = requests.get(
-            f"{ENV_BASE_URL}/state",
-            params={"task_id": task_id},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(f"Cannot connect to environment at {ENV_BASE_URL}. Error: {e}")
-    except requests.exceptions.Timeout:
-        raise RuntimeError(f"Timeout on /state for task {task_id}")
-    except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"HTTP error on /state for {task_id}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"env_step failed for {task_id}: {e}")
 
 
 # ── LLM agent ────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a health-conscious food advisor. 
-You will be presented with a meal scenario including context (time of day, hunger level, budget, health goal)
-and a list of food options numbered from 0.
-
-Your task:
-1. Analyze each food option's nutritional value, calories, and fit with the health goal.
-2. Select the HEALTHIEST option that fits within the budget.
-3. Respond ONLY with a JSON object in this exact format:
+SYSTEM_PROMPT = """You are a health-conscious food advisor.
+You will be presented with a meal scenario and a list of food options numbered from 0.
+Respond ONLY with a JSON object:
 {"selected_item_index": <integer>, "reasoning": "<brief explanation>"}
-
-Prioritize: nutrition_score > calories (lower is often better) > price.
-Always pick healthy over junk food.
-"""
+Prioritize: nutrition_score > calories (lower better) > price. Always pick healthy over junk."""
 
 
-def build_user_prompt(obs: dict) -> str:
+def build_user_prompt(obs):
     ctx = obs["context"]
     options = obs["food_options"]
-
     options_text = "\n".join([
         f"{i}. {f['name']} | Cal:{f['calories']} | NutriScore:{f['nutrition_score']}/10 "
         f"| Price:${f['price']} | {f['description']}"
         for i, f in enumerate(options)
     ])
-
     return f"""=== Meal {obs['meal_number']} — {ctx['time_of_day'].upper()} ===
 Health Goal: {ctx['health_goal']}
 Hunger Level: {ctx['hunger_level']}/10
@@ -213,15 +225,13 @@ Available options:
 Choose the healthiest option. Reply only with JSON."""
 
 
-def agent_choose(obs: dict) -> tuple[int, str]:
-    """Call LLM to choose food item. Returns (index, reasoning)."""
-    user_msg = build_user_prompt(obs)
+def agent_choose(obs):
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_msg},
+                {"role": "user", "content": build_user_prompt(obs)},
             ],
             max_tokens=200,
             temperature=0.1,
@@ -230,48 +240,39 @@ def agent_choose(obs: dict) -> tuple[int, str]:
         raw = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw)
         idx = int(parsed.get("selected_item_index", 0))
-        reasoning = parsed.get("reasoning", "")
-        num_options = len(obs["food_options"])
-        idx = max(0, min(idx, num_options - 1))
-        return idx, reasoning
+        idx = max(0, min(idx, len(obs["food_options"]) - 1))
+        return idx, parsed.get("reasoning", "")
     except Exception as e:
         print(json.dumps({"event": "AGENT_ERROR", "error": str(e)}), flush=True)
-        return 0, f"fallback due to error: {e}"
+        return 0, f"fallback: {e}"
 
 
 # ── Episode runner ────────────────────────────────────────────────────────────
-def run_episode(task_id: str, episode: int = 1) -> dict:
+def run_episode(task_id, episode=1):
     log_start(task_id, episode)
+    obs = env_reset(task_id)["observation"]
 
-    reset_result = env_reset(task_id)
-    obs = reset_result["observation"]
-
-    total_reward      = 0.0
-    step_num          = 0
-    all_rewards       = []
-    all_categories    = []
-    all_choices       = []
-    all_nutrition     = []
-    all_budget_ok     = []
-    health_trajectory = []
+    total_reward = 0.0
+    step_num = 0
+    rewards, categories, choices, nutrition, budget_ok, trajectory = [], [], [], [], [], []
 
     while True:
         action_idx, reasoning = agent_choose(obs)
-        step_result = env_step(task_id, action_idx, reasoning)
+        result = env_step(task_id, action_idx, reasoning)
 
-        reward   = step_result["reward"]
-        done     = step_result["done"]
-        info     = step_result.get("info", {})
-        next_obs = step_result["observation"]
+        reward = result["reward"]
+        done = result["done"]
+        info = result.get("info", {})
+        next_obs = result["observation"]
 
         total_reward += reward
-        step_num     += 1
-        all_rewards.append(reward)
-        all_categories.append(info.get("food_category", "unknown"))
-        all_choices.append(info.get("chosen_food", "unknown"))
-        all_nutrition.append(float(info.get("nutrition_score", 5.0)))
-        all_budget_ok.append(True)
-        health_trajectory.append(float(info.get("health_score_after", 50.0)))
+        step_num += 1
+        rewards.append(reward)
+        categories.append(info.get("food_category", "unknown"))
+        choices.append(info.get("chosen_food", "unknown"))
+        nutrition.append(float(info.get("nutrition_score", 5.0)))
+        budget_ok.append(True)
+        trajectory.append(float(info.get("health_score_after", 50.0)))
 
         log_step(task_id, episode, step_num, action_idx, reward, done, info)
 
@@ -279,76 +280,50 @@ def run_episode(task_id: str, episode: int = 1) -> dict:
             break
         obs = next_obs
 
-    grader_score = compute_grader_score(
-        task_id, all_rewards, all_choices, health_trajectory,
-        all_categories, all_nutrition, all_budget_ok
-    )
-
-    log_end(task_id, episode, round(total_reward, 4), grader_score, step_num, all_choices)
-
+    grader_score = compute_grader_score(task_id, rewards, choices, trajectory,
+                                        categories, nutrition, budget_ok)
+    log_end(task_id, episode, round(total_reward, 4), grader_score, step_num, choices)
     return {
-        "task_id":      task_id,
-        "episode":      episode,
+        "task_id": task_id, "episode": episode,
         "total_reward": round(total_reward, 4),
-        "grader_score": grader_score,
-        "steps":        step_num,
-        "choices":      all_choices,
+        "grader_score": grader_score, "steps": step_num, "choices": choices,
     }
 
 
-def compute_grader_score(task_id, rewards, choices, trajectory, categories,
-                         nutrition, budget_ok) -> float:
-    """Compute grader score locally (mirrors server-side graders)."""
+def compute_grader_score(task_id, rewards, choices, trajectory,
+                         categories, nutrition, budget_ok):
     if task_id == "task_1_easy":
-        num_healthy   = sum(1 for c in categories if c == "healthy")
-        healthy_ratio = num_healthy / len(categories) if categories else 0.0
-        avg_reward    = sum(rewards) / len(rewards) if rewards else 0.0
+        healthy_ratio = sum(1 for c in categories if c == "healthy") / len(categories) if categories else 0.0
+        avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
         return round(min(1.0, 0.6 * healthy_ratio + 0.4 * avg_reward), 4)
 
     elif task_id == "task_2_medium":
-        num_healthy   = sum(1 for c in categories if c == "healthy")
-        healthy_ratio = num_healthy / len(categories) if categories else 0.0
-        health_imp    = max(0, trajectory[-1] - trajectory[0]) / 50.0 if len(trajectory) >= 2 else 0.0
-        health_imp    = min(1.0, health_imp)
-        budget_ratio  = sum(budget_ok) / len(budget_ok) if budget_ok else 1.0
-        consec = 0
-        max_c  = 0
+        healthy_ratio = sum(1 for c in categories if c == "healthy") / len(categories) if categories else 0.0
+        health_imp = min(1.0, max(0, trajectory[-1] - trajectory[0]) / 50.0) if len(trajectory) >= 2 else 0.0
+        budget_ratio = sum(budget_ok) / len(budget_ok) if budget_ok else 1.0
+        consec = max_c = 0
         for c in categories:
-            if c == "junk":
-                consec += 1
-                max_c = max(max_c, consec)
-            else:
-                consec = 0
+            consec = consec + 1 if c == "junk" else 0
+            max_c = max(max_c, consec)
         consec_pen = 1.0 - min(1.0, max_c / len(categories))
-        score = 0.40*healthy_ratio + 0.30*health_imp + 0.15*budget_ratio + 0.15*consec_pen
-        return round(min(1.0, max(0.0, score)), 4)
+        return round(min(1.0, max(0.0,
+            0.40*healthy_ratio + 0.30*health_imp + 0.15*budget_ratio + 0.15*consec_pen)), 4)
 
     elif task_id == "task_3_hard":
-        if len(trajectory) >= 2:
-            improvements = sum(
-                1 for i in range(1, len(trajectory)) if trajectory[i] >= trajectory[i-1]
-            )
-            traj_score = improvements / (len(trajectory) - 1)
-        else:
-            traj_score = 0.0
-        avg_nut       = sum(nutrition) / len(nutrition) if nutrition else 0.0
-        nut_comp      = avg_nut / 10.0
-        num_healthy   = sum(1 for c in categories if c == "healthy")
-        healthy_ratio = num_healthy / len(categories) if categories else 0.0
-        reward_eff    = sum(rewards) / len(rewards) if rewards else 0.0
-        score = 0.35*traj_score + 0.25*nut_comp + 0.25*healthy_ratio + 0.15*reward_eff
-        return round(min(1.0, max(0.0, score)), 4)
-
+        traj_score = sum(1 for i in range(1, len(trajectory)) if trajectory[i] >= trajectory[i-1]) / (len(trajectory)-1) if len(trajectory) >= 2 else 0.0
+        nut_comp = (sum(nutrition)/len(nutrition)/10.0) if nutrition else 0.0
+        healthy_ratio = sum(1 for c in categories if c == "healthy") / len(categories) if categories else 0.0
+        reward_eff = sum(rewards) / len(rewards) if rewards else 0.0
+        return round(min(1.0, max(0.0,
+            0.35*traj_score + 0.25*nut_comp + 0.25*healthy_ratio + 0.15*reward_eff)), 4)
     return 0.0
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print(json.dumps({
-        "event":     "INFERENCE_START",
-        "model":     MODEL_NAME,
-        "env_url":   ENV_BASE_URL,
-        "tasks":     TASKS,
+        "event": "INFERENCE_START", "model": MODEL_NAME,
+        "env_url": ACTIVE_ENV_URL, "tasks": TASKS,
         "timestamp": time.time(),
     }), flush=True)
 
@@ -359,13 +334,11 @@ def main():
             all_results.append(result)
         except Exception as e:
             print(json.dumps({
-                "event":   "TASK_ERROR",
-                "task_id": task_id,
-                "error":   str(e),
+                "event": "TASK_ERROR", "task_id": task_id, "error": str(e),
             }), flush=True)
 
     print(json.dumps({
-        "event":   "INFERENCE_COMPLETE",
+        "event": "INFERENCE_COMPLETE",
         "results": all_results,
         "avg_grader_score": round(
             sum(r["grader_score"] for r in all_results) / len(all_results), 4
