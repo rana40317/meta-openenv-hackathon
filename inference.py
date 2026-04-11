@@ -1,5 +1,8 @@
 """
+inference.py — Baseline inference script for HealthyFoodChoice RL environment.
 
+Uses OpenAI client (Anthropic-compatible endpoint) to run the LLM agent.
+Emits structured [START], [STEP], [END] logs to stdout.
 
 Environment variables required:
   API_BASE_URL  — API endpoint for the LLM
@@ -13,41 +16,63 @@ import os
 import sys
 import json
 import time
-import requests
-from openai import OpenAI
+
+# ── Safe imports ──────────────────────────────────────────────────────────────
+try:
+    import requests
+except ImportError as e:
+    print(json.dumps({"event": "IMPORT_ERROR", "error": f"requests not installed: {e}", "timestamp": time.time()}), flush=True)
+    sys.exit(1)
+
+try:
+    from openai import OpenAI
+except ImportError as e:
+    print(json.dumps({"event": "IMPORT_ERROR", "error": f"openai not installed: {e}", "timestamp": time.time()}), flush=True)
+    sys.exit(1)
 
 # ── Environment config ────────────────────────────────────────────────────────
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
+# NOTE: Never hard-exit if vars are missing — validator injects them at runtime.
+# Check multiple possible env var names and fall back to safe defaults.
+API_BASE_URL = (
+    os.environ.get("API_BASE_URL")
+    or os.environ.get("OPENAI_BASE_URL")
+    or "https://api-inference.huggingface.co/v1"
+)
+MODEL_NAME = (
+    os.environ.get("MODEL_NAME")
+    or os.environ.get("MODEL")
+    or "Qwen/Qwen2.5-72B-Instruct"
+)
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    or os.environ.get("OPENAI_API_KEY")
+    or "dummy-token"   # allows client to init; real calls will fail gracefully
+)
+ENV_BASE_URL = (
+    os.environ.get("ENV_BASE_URL")
+    or "http://localhost:7860"
+)
 
 TASKS = ["task_1_easy", "task_2_medium", "task_3_hard"]
 
-# ── Validate required env vars before anything else ───────────────────────────
-if not API_BASE_URL:
-    print(json.dumps({
-        "event": "CONFIG_ERROR",
-        "error": "API_BASE_URL environment variable is not set",
-        "timestamp": time.time(),
-    }), flush=True)
-    sys.exit(1)
-
-if not HF_TOKEN:
-    print(json.dumps({
-        "event": "CONFIG_ERROR",
-        "error": "HF_TOKEN environment variable is not set or empty",
-        "timestamp": time.time(),
-    }), flush=True)
-    sys.exit(1)
+# ── Log config at startup ─────────────────────────────────────────────────────
+print(json.dumps({
+    "event":        "CONFIG",
+    "api_base_url": API_BASE_URL,
+    "model":        MODEL_NAME,
+    "env_url":      ENV_BASE_URL,
+    "hf_token_set": bool(HF_TOKEN and HF_TOKEN != "dummy-token"),
+    "timestamp":    time.time(),
+}), flush=True)
 
 # ── Initialise OpenAI client safely ──────────────────────────────────────────
 try:
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 except Exception as e:
     print(json.dumps({
-        "event": "CLIENT_INIT_ERROR",
-        "error": str(e),
+        "event":     "CLIENT_INIT_ERROR",
+        "error":     str(e),
         "timestamp": time.time(),
     }), flush=True)
     sys.exit(1)
@@ -106,14 +131,9 @@ def env_reset(task_id: str) -> dict:
         r.raise_for_status()
         return r.json()
     except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(
-            f"Cannot connect to environment at {ENV_BASE_URL}. "
-            f"Is the env container running? Error: {e}"
-        )
+        raise RuntimeError(f"Cannot connect to environment at {ENV_BASE_URL}. Error: {e}")
     except requests.exceptions.Timeout:
-        raise RuntimeError(
-            f"Timeout connecting to environment at {ENV_BASE_URL}/reset for task {task_id}"
-        )
+        raise RuntimeError(f"Timeout on /reset for task {task_id} at {ENV_BASE_URL}")
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"HTTP error on /reset for {task_id}: {e}")
 
@@ -130,14 +150,9 @@ def env_step(task_id: str, action_index: int, reasoning: str = "") -> dict:
         r.raise_for_status()
         return r.json()
     except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(
-            f"Cannot connect to environment at {ENV_BASE_URL}. "
-            f"Is the env container running? Error: {e}"
-        )
+        raise RuntimeError(f"Cannot connect to environment at {ENV_BASE_URL}. Error: {e}")
     except requests.exceptions.Timeout:
-        raise RuntimeError(
-            f"Timeout connecting to environment at {ENV_BASE_URL}/step for task {task_id}"
-        )
+        raise RuntimeError(f"Timeout on /step for task {task_id}")
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"HTTP error on /step for {task_id}: {e}")
 
@@ -152,14 +167,9 @@ def env_state(task_id: str) -> dict:
         r.raise_for_status()
         return r.json()
     except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(
-            f"Cannot connect to environment at {ENV_BASE_URL}. "
-            f"Is the env container running? Error: {e}"
-        )
+        raise RuntimeError(f"Cannot connect to environment at {ENV_BASE_URL}. Error: {e}")
     except requests.exceptions.Timeout:
-        raise RuntimeError(
-            f"Timeout connecting to environment at {ENV_BASE_URL}/state for task {task_id}"
-        )
+        raise RuntimeError(f"Timeout on /state for task {task_id}")
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"HTTP error on /state for {task_id}: {e}")
 
@@ -217,7 +227,6 @@ def agent_choose(obs: dict) -> tuple[int, str]:
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
         raw = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw)
         idx = int(parsed.get("selected_item_index", 0))
@@ -226,7 +235,6 @@ def agent_choose(obs: dict) -> tuple[int, str]:
         idx = max(0, min(idx, num_options - 1))
         return idx, reasoning
     except Exception as e:
-        # Fallback: pick option 0 (usually healthy in easy task)
         print(json.dumps({"event": "AGENT_ERROR", "error": str(e)}), flush=True)
         return 0, f"fallback due to error: {e}"
 
@@ -238,13 +246,13 @@ def run_episode(task_id: str, episode: int = 1) -> dict:
     reset_result = env_reset(task_id)
     obs = reset_result["observation"]
 
-    total_reward    = 0.0
-    step_num        = 0
-    all_rewards     = []
-    all_categories  = []
-    all_choices     = []
-    all_nutrition   = []
-    all_budget_ok   = []
+    total_reward      = 0.0
+    step_num          = 0
+    all_rewards       = []
+    all_categories    = []
+    all_choices       = []
+    all_nutrition     = []
+    all_budget_ok     = []
     health_trajectory = []
 
     while True:
@@ -271,7 +279,6 @@ def run_episode(task_id: str, episode: int = 1) -> dict:
             break
         obs = next_obs
 
-    # Grade the episode
     grader_score = compute_grader_score(
         task_id, all_rewards, all_choices, health_trajectory,
         all_categories, all_nutrition, all_budget_ok
@@ -357,7 +364,6 @@ def main():
                 "error":   str(e),
             }), flush=True)
 
-    # Summary
     print(json.dumps({
         "event":   "INFERENCE_COMPLETE",
         "results": all_results,
