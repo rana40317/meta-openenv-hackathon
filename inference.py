@@ -16,12 +16,12 @@ except ImportError as e:
     print(f"IMPORT_ERROR: {e}", flush=True)
     sys.exit(1)
 
-API_BASE_URL = os.environ.get("API_BASE_URL") or "https://api-inference.huggingface.co/v1"
+API_BASE_URL = os.environ.get("API_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api-inference.huggingface.co/v1"
 MODEL_NAME   = os.environ.get("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
-HF_TOKEN     = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "dummy-token"
+API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("OPENAI_API_KEY") or "dummy-token"
 TASKS = ["task_1_easy", "task_2_medium", "task_3_hard"]
 
-print(f"CONFIG model={MODEL_NAME}", flush=True)
+print(f"CONFIG model={MODEL_NAME} api_base={API_BASE_URL} api_key_set={bool(API_KEY and API_KEY != 'dummy-token')}", flush=True)
 
 def start_local_server(port):
     try:
@@ -65,7 +65,7 @@ if not ACTIVE_ENV_URL:
     sys.exit(0)
 
 try:
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 except Exception as e:
     print(f"CLIENT_ERROR: {e}", flush=True)
     client = None
